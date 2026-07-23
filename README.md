@@ -11,9 +11,9 @@ Point it at any repo (local path or GitHub URL) and ask questions like:
 
 ## How it works
 
-The agent (default model: `gpt-5.4`) classifies each question as current-state,
-historical, intent, or mixed, then follows the appropriate evidence path. It
-investigates using eight read-only tools:
+The agent uses the OpenAI Responses API with `gpt-5.6-sol` and medium reasoning by
+default. It classifies each question as current-state, historical, intent, or mixed,
+then follows the appropriate evidence path using eight read-only tools:
 
 | Tool | Backing command |
 |---|---|
@@ -83,7 +83,7 @@ all five cases with `gpt-5.4`.
 
 ## Setup
 
-Requires Python 3.9+, Node 18+, git.
+Requires Python 3.9+, Node 20.19+, git.
 
 ```bash
 python3 -m venv .venv
@@ -124,7 +124,8 @@ root (copy `.env.example` to get started).
 | Env var | Default | Purpose |
 |---|---|---|
 | `OPENAI_API_KEY` | — | required |
-| `MENTAL_MODEL_LLM` | `gpt-5.4` | override the model |
+| `MENTAL_MODEL_LLM` | `gpt-5.6-sol` | override the model |
+| `MENTAL_MODEL_REASONING_EFFORT` | `medium` | Responses API reasoning effort |
 | `APP_PASSWORD` | empty (gate disabled) | password required to access the app |
 | `GITHUB_TOKEN` | empty | optional; raises GitHub API limits and enables private repos |
 

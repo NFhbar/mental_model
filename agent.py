@@ -9,11 +9,22 @@ from openai import AsyncOpenAI
 
 from tools import TOOL_SCHEMAS, GitRepo, dispatch_tool
 
-MODEL = os.environ.get("MENTAL_MODEL_LLM", "gpt-5.4")
+MODEL = os.environ.get("MENTAL_MODEL_LLM", "gpt-5.6-sol")
+REASONING_EFFORT = os.environ.get("MENTAL_MODEL_REASONING_EFFORT", "medium")
 MAX_TURNS = 25
 EVIDENCE_BLOCK_RE = re.compile(r"<evidence>\s*(.*?)\s*</evidence>", re.DOTALL)
 EVIDENCE_CITATION_RE = re.compile(r"\[(e\d+)\]")
 LINE_PREFIX_RE = re.compile(r"(?m)^\s*\d+\|\s?")
+RESPONSE_TOOLS = [
+    {
+        "type": "function",
+        "name": schema["function"]["name"],
+        "description": schema["function"]["description"],
+        "parameters": schema["function"]["parameters"],
+        "strict": False,
+    }
+    for schema in TOOL_SCHEMAS
+]
 
 SYSTEM_PROMPT = """You are Mental Model: an expert investigator of software repositories.
 You explain a repository's purpose, architecture, behavior, and history using evidence.
@@ -235,16 +246,39 @@ def verify_evidence(
     return problems, report
 
 
+def classify_question(question: str) -> str:
+    text = question.lower()
+    intent = any(
+        term in text
+        for term in ("why", "motivation", "trade-off", "tradeoff", "rationale")
+    )
+    history = any(
+        term in text
+        for term in ("when", "who", "history", "changed", "evolution", "introduced")
+    )
+    if intent and history:
+        return "MIXED"
+    if intent:
+        return "INTENT"
+    if history:
+        return "HISTORY"
+    return "CURRENT_STATE"
+
+
+QUESTION_PLANS = {
+    "CURRENT_STATE": "Inspect documentation and source at HEAD, then cite the primary files.",
+    "HISTORY": "Locate the relevant change, corroborate its commit, then reconstruct the timeline.",
+    "INTENT": "Find the implementing change, then inspect PR discussion for stated rationale.",
+    "MIXED": "Combine current source, commit history, and PR discussion into one evidence chain.",
+}
+
+
 class MentalModel:
     def __init__(self, repo: GitRepo):
         self.repo = repo
         self.client = AsyncOpenAI()
-        self.messages: List[Dict] = [
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT.format(repo_summary=repo.prompt_context()),
-            }
-        ]
+        self.instructions = SYSTEM_PROMPT.format(repo_summary=repo.prompt_context())
+        self.input_items: List[Dict] = []
         self.seen_sources: Dict[str, List[str]] = {}
         self.runtime = {
             "questions": 0,
@@ -271,17 +305,23 @@ class MentalModel:
         if key:
             self.seen_sources.setdefault(key, []).append(result)
 
-    async def _complete(self):
-        return await self.client.chat.completions.create(
+    async def _complete(self, input_items: List[Dict]):
+        return await self.client.responses.create(
             model=MODEL,
-            messages=self.messages,
-            tools=TOOL_SCHEMAS,
+            instructions=self.instructions,
+            input=input_items,
+            tools=RESPONSE_TOOLS,
             tool_choice="auto",
+            parallel_tool_calls=True,
+            reasoning={"effort": REASONING_EFFORT, "summary": "auto"},
+            include=["reasoning.encrypted_content"],
+            store=False,
+            truncation="auto",
         )
 
     def snapshot_state(self) -> Dict:
         return {
-            "messages": copy.deepcopy(self.messages),
+            "input_items": copy.deepcopy(self.input_items),
             "seen_sources": copy.deepcopy(self.seen_sources),
             "runtime": copy.deepcopy(self.runtime),
             "last_investigation": copy.deepcopy(self.last_investigation),
@@ -291,7 +331,7 @@ class MentalModel:
         }
 
     def restore_state(self, snapshot: Dict):
-        self.messages = snapshot["messages"]
+        self.input_items = snapshot["input_items"]
         self.seen_sources = snapshot["seen_sources"]
         self.runtime = snapshot["runtime"]
         self.last_investigation = snapshot["last_investigation"]
@@ -314,6 +354,8 @@ class MentalModel:
             )
         return {
             "model": MODEL,
+            "api": "responses",
+            "reasoning_effort": REASONING_EFFORT,
             "repository_context": self.repo.prompt_context(),
             "capabilities": capabilities,
             "policy": {
@@ -345,58 +387,58 @@ class MentalModel:
         started_at = time.monotonic()
         starting_tool_calls = self.runtime["tool_calls"]
         starting_retries = self.runtime["verification_retries"]
-        question_type = None
+        question_type = classify_question(question)
         self.runtime["questions"] += 1
-        self.messages.append({"role": "user", "content": question})
+        input_items = copy.deepcopy(self.input_items)
+        input_items.append({"role": "user", "content": question})
         verification_attempts = 0
+        yield AgentEvent.make(
+            "thought",
+            text=(
+                f"Question type: {question_type}. "
+                f"Plan: {QUESTION_PLANS[question_type]}"
+            ),
+        )
 
         for _ in range(MAX_TURNS):
-            response = await self._complete()
+            response = await self._complete(input_items)
             if response.usage:
-                self.runtime["input_tokens"] += response.usage.prompt_tokens
-                self.runtime["output_tokens"] += response.usage.completion_tokens
-            choice = response.choices[0]
-            msg = choice.message
+                self.runtime["input_tokens"] += response.usage.input_tokens
+                self.runtime["output_tokens"] += response.usage.output_tokens
+            input_items.extend(
+                item.model_dump(exclude_none=True) for item in response.output
+            )
+            tool_calls = [
+                item for item in response.output if item.type == "function_call"
+            ]
 
-            if msg.tool_calls:
-                self.runtime["tool_calls"] += len(msg.tool_calls)
-                self.messages.append(
-                    {
-                        "role": "assistant",
-                        "content": msg.content,
-                        "tool_calls": [tc.model_dump() for tc in msg.tool_calls],
-                    }
-                )
-                if msg.content:
-                    type_match = re.search(
-                        r"Question type:\s*(CURRENT_STATE|HISTORY|INTENT|MIXED)",
-                        msg.content,
-                        re.IGNORECASE,
-                    )
-                    if type_match:
-                        question_type = type_match.group(1).upper()
-                    yield AgentEvent.make("thought", text=msg.content)
-                for tc in msg.tool_calls:
+            if tool_calls:
+                self.runtime["tool_calls"] += len(tool_calls)
+                tool_outputs = []
+                for tool_call in tool_calls:
                     try:
-                        args = json.loads(tc.function.arguments or "{}")
+                        args = json.loads(tool_call.arguments or "{}")
                     except json.JSONDecodeError:
                         args = {}
-                    yield AgentEvent.make("tool_call", name=tc.function.name, args=args)
-                    result = dispatch_tool(self.repo, tc.function.name, args)
-                    self._register_source(tc.function.name, args, result)
                     yield AgentEvent.make(
-                        "tool_result", name=tc.function.name, result=result
+                        "tool_call", name=tool_call.name, args=args
                     )
-                    self.messages.append(
+                    result = dispatch_tool(self.repo, tool_call.name, args)
+                    self._register_source(tool_call.name, args, result)
+                    yield AgentEvent.make(
+                        "tool_result", name=tool_call.name, result=result
+                    )
+                    tool_outputs.append(
                         {
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": result,
+                            "type": "function_call_output",
+                            "call_id": tool_call.call_id,
+                            "output": result,
                         }
                     )
+                input_items.extend(tool_outputs)
                 continue
 
-            raw_answer = msg.content or ""
+            raw_answer = response.output_text or ""
             answer, evidence, parse_problems = parse_evidence_answer(raw_answer)
             problems, verification_report = verify_evidence(
                 self.repo,
@@ -413,8 +455,7 @@ class MentalModel:
                     problems=problems,
                     report=verification_report,
                 )
-                self.messages.append({"role": "assistant", "content": raw_answer})
-                self.messages.append(
+                input_items.append(
                     {
                         "role": "user",
                         "content": VERIFICATION_RETRY_PROMPT.format(
@@ -424,7 +465,7 @@ class MentalModel:
                 )
                 continue
 
-            self.messages.append({"role": "assistant", "content": raw_answer})
+            self.input_items = input_items
             direct_count = sum(
                 item.get("kind") == "direct"
                 for item in evidence

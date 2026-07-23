@@ -15,7 +15,7 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from agent import MODEL, MentalModel
+from agent import MODEL, REASONING_EFFORT, MentalModel
 from tools import GitToolError, prepare_repo
 
 app = FastAPI(title="Mental Model")
@@ -105,6 +105,8 @@ async def diagnose(x_auth_token: str = Header(default="")):
         "api_key_set": bool(key),
         "api_key_suffix": key[-4:] if key else None,
         "configured_model": MODEL,
+        "api": "responses",
+        "reasoning_effort": REASONING_EFFORT,
         "available_models": [],
         "model_probe": None,
     }
@@ -118,12 +120,27 @@ async def diagnose(x_auth_token: str = Header(default="")):
     except Exception as exc:
         report["available_models_error"] = str(exc)
     try:
-        await client.chat.completions.create(
+        response = await client.responses.create(
             model=MODEL,
-            messages=[{"role": "user", "content": "ping"}],
-            max_completion_tokens=16,
+            input="Call diagnostic_ping.",
+            tools=[
+                {
+                    "type": "function",
+                    "name": "diagnostic_ping",
+                    "description": "Confirm that function tools are available.",
+                    "parameters": {"type": "object", "properties": {}},
+                    "strict": False,
+                }
+            ],
+            reasoning={"effort": REASONING_EFFORT},
+            max_output_tokens=64,
+            store=False,
         )
-        report["model_probe"] = {"ok": True}
+        tool_ok = any(item.type == "function_call" for item in response.output)
+        report["model_probe"] = {
+            "ok": tool_ok,
+            "error": None if tool_ok else "model did not call the diagnostic tool",
+        }
     except Exception as exc:
         report["model_probe"] = {"ok": False, "error": str(exc)}
     return report

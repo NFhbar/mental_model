@@ -469,7 +469,9 @@ function MetaPanel({
           <h1>Mental Model capabilities</h1>
           <p>The live context, investigation policy, tools, and verification boundary.</p>
         </div>
-        <span className="meta-model">{meta.model}</span>
+        <span className="meta-model">
+          {meta.model} · {meta.api} · {meta.reasoning_effort}
+        </span>
       </section>
 
       <section className="meta-card">
@@ -629,6 +631,8 @@ function DiagnosePanel({ onClose, token, onAuthExpired }) {
             </dd>
             <dt>Configured model</dt>
             <dd>{report.configured_model}</dd>
+            <dt>API and reasoning</dt>
+            <dd>{report.api} · {report.reasoning_effort}</dd>
             <dt>Model probe</dt>
             <dd className={report.model_probe?.ok ? 'ok' : 'bad'}>
               {report.model_probe?.ok ? 'chat completion succeeded' : report.model_probe?.error}

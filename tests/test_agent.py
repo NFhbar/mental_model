@@ -91,19 +91,22 @@ class EvidenceVerificationTest(unittest.TestCase):
 
     def test_agent_state_can_be_restored_after_cancellation(self):
         agent = MentalModel.__new__(MentalModel)
-        agent.messages = [{"role": "system", "content": "policy"}]
+        agent.input_items = [{"role": "user", "content": "prior question"}]
         agent.seen_sources = {"file:README.md@HEAD": ["evidence"]}
         agent.runtime = {"questions": 1}
         agent.last_investigation = {"verified": True}
         agent.last_verification_report = [{"id": "e1"}]
         snapshot = agent.snapshot_state()
-        agent.messages.append({"role": "user", "content": "cancelled"})
+        agent.input_items.append({"role": "user", "content": "cancelled"})
         agent.seen_sources.clear()
         agent.runtime["questions"] = 2
         agent.last_investigation = None
         agent.last_verification_report = []
         agent.restore_state(snapshot)
-        self.assertEqual(agent.messages, [{"role": "system", "content": "policy"}])
+        self.assertEqual(
+            agent.input_items,
+            [{"role": "user", "content": "prior question"}],
+        )
         self.assertEqual(
             agent.seen_sources,
             {"file:README.md@HEAD": ["evidence"]},
