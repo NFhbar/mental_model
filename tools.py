@@ -5,12 +5,14 @@ import shutil
 import subprocess
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Dict, List, Optional
 
 MAX_OUTPUT_CHARS = 8000
 SHA_RE = re.compile(r"^[0-9a-fA-F]{4,40}$")
 REF_RE = re.compile(r"^[\w./~^@{}-]+$")
+GITHUB_PATH_RE = re.compile(r"^/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$")
 
 
 class GitToolError(Exception):
@@ -28,6 +30,38 @@ def _validate_ref(ref: str) -> str:
     if not REF_RE.match(ref) or ref.startswith("-"):
         raise GitToolError(f"invalid ref: {ref!r}")
     return ref
+
+
+def canonical_repo_source(source: str, allow_local_repos: bool = True) -> str:
+    source = source.strip()
+    if "://" in source or source.startswith("git@"):
+        parsed = urllib.parse.urlsplit(source)
+        match = GITHUB_PATH_RE.fullmatch(parsed.path)
+        try:
+            port = parsed.port
+        except ValueError:
+            raise GitToolError("remote repository URL has an invalid port")
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "github.com"
+            or port not in (None, 443)
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or not match
+        ):
+            raise GitToolError(
+                "remote repositories must use https://github.com/<owner>/<repo>"
+            )
+        owner, repo = match.groups()
+        return f"https://github.com/{owner}/{repo}.git"
+    if not allow_local_repos:
+        raise GitToolError("local repository paths are disabled")
+    expanded = os.path.realpath(os.path.expanduser(source))
+    if not os.path.isdir(expanded):
+        raise GitToolError(f"no such directory: {source}")
+    return expanded
 
 
 class GitRepo:
@@ -223,7 +257,7 @@ class GitRepo:
             if len(lines) > limit
             else ""
         )
-        return "\n".join(selected) + suffix if selected else "no code matched"
+        return _truncate("\n".join(selected) + suffix) if selected else "no code matched"
 
     def list_tree(self, path: str = ".", ref: str = "HEAD") -> str:
         _validate_ref(ref)
@@ -309,24 +343,45 @@ class GitRepo:
         return _truncate("\n".join(lines))
 
 
-def prepare_repo(source: str) -> GitRepo:
-    source = source.strip()
-    if re.match(r"^(https?://|git@)", source):
+def prepare_repo(
+    source: str,
+    allow_local_repos: bool = True,
+    clone_timeout_seconds: int = 120,
+) -> GitRepo:
+    source = canonical_repo_source(source, allow_local_repos)
+    if source.startswith("https://github.com/"):
         dest = tempfile.mkdtemp(prefix="mental-model-")
-        result = subprocess.run(
-            ["git", "clone", source, dest],
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
+        env = {
+            **os.environ,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_LFS_SKIP_SMUDGE": "1",
+        }
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "--filter=blob:none",
+                    "--no-tags",
+                    "--single-branch",
+                    source,
+                    dest,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=clone_timeout_seconds,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            shutil.rmtree(dest, ignore_errors=True)
+            raise GitToolError(
+                f"clone timed out after {clone_timeout_seconds} seconds"
+            )
         if result.returncode != 0:
             shutil.rmtree(dest, ignore_errors=True)
             raise GitToolError(f"clone failed: {result.stderr.strip()[:500]}")
         return GitRepo(dest, temporary=True)
-    expanded = os.path.expanduser(source)
-    if not os.path.isdir(expanded):
-        raise GitToolError(f"no such directory: {source}")
-    return GitRepo(expanded)
+    return GitRepo(source)
 
 
 TOOL_SCHEMAS = [

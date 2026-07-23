@@ -686,7 +686,13 @@ function PasswordGate({ onAuth }) {
   )
 }
 
-function RepoPicker({ onOpen, busy, onCancel = null, compact = false }) {
+function RepoPicker({
+  onOpen,
+  busy,
+  onCancel = null,
+  compact = false,
+  allowLocalRepositories = true,
+}) {
   const [source, setSource] = useState('')
   const [error, setError] = useState(null)
 
@@ -703,11 +709,19 @@ function RepoPicker({ onOpen, busy, onCancel = null, compact = false }) {
   return (
     <form className={`repo-picker ${compact ? 'repo-picker-compact' : ''}`} onSubmit={submit}>
       <h1>Mental Model</h1>
-      <p>Point me at a repository and ask me anything about it.</p>
+      <p>
+        {allowLocalRepositories
+          ? 'Point me at a local or GitHub repository and ask me anything about it.'
+          : 'Point me at a public GitHub repository and ask me anything about it.'}
+      </p>
       <input
         value={source}
         onChange={(e) => setSource(e.target.value)}
-        placeholder="Local path or GitHub URL (e.g. https://github.com/pallets/click)"
+        placeholder={
+          allowLocalRepositories
+            ? 'Local path or https://github.com/owner/repo'
+            : 'https://github.com/owner/repo'
+        }
         autoFocus
       />
       <div className="repo-picker-actions">
@@ -719,11 +733,17 @@ function RepoPicker({ onOpen, busy, onCancel = null, compact = false }) {
   )
 }
 
-function RepositoryDialog({ onOpen, busy, onClose }) {
+function RepositoryDialog({ onOpen, busy, onClose, allowLocalRepositories }) {
   return (
     <div className="diagnose-overlay" onClick={onClose}>
       <div className="repository-dialog" onClick={(event) => event.stopPropagation()}>
-        <RepoPicker onOpen={onOpen} busy={busy} onCancel={onClose} compact />
+        <RepoPicker
+          onOpen={onOpen}
+          busy={busy}
+          onCancel={onClose}
+          compact
+          allowLocalRepositories={allowLocalRepositories}
+        />
       </div>
     </div>
   )
@@ -1214,7 +1234,15 @@ export default function App() {
       />
     )
 
-  if (repositories.length === 0) return <RepoPicker onOpen={openRepo} busy={busy} />
+  if (repositories.length === 0) {
+    return (
+      <RepoPicker
+        onOpen={openRepo}
+        busy={busy}
+        allowLocalRepositories={config.allow_local_repositories}
+      />
+    )
+  }
 
   return (
     <div className="layout">
@@ -1277,6 +1305,7 @@ export default function App() {
           onOpen={openRepo}
           busy={busy}
           onClose={() => !busy && setShowRepositoryDialog(false)}
+          allowLocalRepositories={config.allow_local_repositories}
         />
       )}
       {showDiagnose && (

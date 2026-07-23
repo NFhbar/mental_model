@@ -7,7 +7,10 @@ from typing import AsyncIterator, Dict, List, Tuple
 
 from openai import AsyncOpenAI
 
+from config import load_local_env
 from tools import TOOL_SCHEMAS, GitRepo, dispatch_tool
+
+load_local_env()
 
 MODEL = os.environ.get("MENTAL_MODEL_LLM", "gpt-5.6-sol")
 REASONING_EFFORT = os.environ.get("MENTAL_MODEL_REASONING_EFFORT", "medium")

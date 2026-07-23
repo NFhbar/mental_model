@@ -3,6 +3,11 @@
 An LLM agent that explains a repository's purpose, architecture, behavior, and history
 using evidence from source files, commits, and GitHub pull requests.
 
+## Live demo
+
+Try Mental Model at [mental-model-edjh.onrender.com](https://mental-model-edjh.onrender.com/).
+The demo is password protected; access is provided via 1Password on request.
+
 Point it at any repo (local path or GitHub URL) and ask questions like:
 
 - "When was shell completion introduced, and what motivated it?"
@@ -128,6 +133,18 @@ root (copy `.env.example` to get started).
 | `MENTAL_MODEL_REASONING_EFFORT` | `medium` | Responses API reasoning effort |
 | `APP_PASSWORD` | empty (gate disabled) | password required to access the app |
 | `GITHUB_TOKEN` | empty | optional; raises GitHub API limits and enables private repos |
+| `ALLOW_LOCAL_REPOS` | `true` | allow local paths; Render sets this to `false` |
+| `MAX_TOTAL_REPOSITORIES` | `9` | process-wide repository capacity |
+| `GIT_CLONE_TIMEOUT_SECONDS` | `120` | remote clone timeout |
+| `AUTH_TOKEN_TTL_SECONDS` | `28800` | authentication token lifetime |
+| `AUTH_FAILURE_LIMIT` | `5` | failed logins allowed per rate window |
+| `ASK_RATE_LIMIT` | `20` | investigations allowed per token per minute |
+
+Remote ingestion accepts only HTTPS GitHub repository URLs. Render disables local
+repository paths. Rotate `APP_PASSWORD` to a generated value before sharing the demo;
+Blueprint secrets remain dashboard-managed and are never stored in `render.yaml`.
+See [SECURITY.md](SECURITY.md) for the deployment boundary, resource controls,
+dependency-advisory rationale, and audit commands.
 
 ## Tests
 

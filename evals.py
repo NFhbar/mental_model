@@ -4,10 +4,6 @@ import json
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
-
-load_dotenv()
-
 from agent import MentalModel
 from tools import prepare_repo
 

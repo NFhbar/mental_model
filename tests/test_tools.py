@@ -3,7 +3,7 @@ import subprocess
 import tempfile
 import unittest
 
-from tools import GitRepo
+from tools import GitRepo, GitToolError, canonical_repo_source
 
 
 class GitToolsTest(unittest.TestCase):
@@ -16,6 +16,8 @@ class GitToolsTest(unittest.TestCase):
             file.write("A repository archaeology agent.\n")
         with open(os.path.join(root, "src", "engine.py"), "w") as file:
             file.write("def investigate_repository():\n    return 'evidence'\n")
+        with open(os.path.join(root, "src", "large.txt"), "w") as file:
+            file.write("SEARCHABLE_" + ("x" * 9000) + "\n")
         subprocess.run(["git", "-C", root, "add", "."], check=True)
         subprocess.run(
             [
@@ -48,6 +50,11 @@ class GitToolsTest(unittest.TestCase):
         result = self.repo.search_code("does_not_exist", ref="HEAD")
         self.assertEqual(result, "no code matched")
 
+    def test_search_code_caps_total_output(self):
+        result = self.repo.search_code("SEARCHABLE_", ref="HEAD")
+        self.assertLess(len(result), 8200)
+        self.assertIn("[truncated", result)
+
     def test_prompt_context_contains_repository_profile(self):
         context = self.repo.prompt_context()
         self.assertIn("commits: 1", context)
@@ -59,6 +66,26 @@ class GitToolsTest(unittest.TestCase):
         self.repo.temporary = True
         self.repo.cleanup()
         self.assertFalse(os.path.exists(root))
+
+    def test_canonical_repo_source_accepts_only_https_github(self):
+        self.assertEqual(
+            canonical_repo_source("https://github.com/pallets/click"),
+            "https://github.com/pallets/click.git",
+        )
+        for source in (
+            "http://github.com/pallets/click",
+            "https://example.com/pallets/click",
+            "https://user:secret@github.com/pallets/click",
+            "https://github.com/pallets/click?ref=main",
+            "git@github.com:pallets/click.git",
+        ):
+            with self.subTest(source=source):
+                with self.assertRaises(GitToolError):
+                    canonical_repo_source(source)
+
+    def test_local_repositories_can_be_disabled(self):
+        with self.assertRaises(GitToolError):
+            canonical_repo_source(self.temp_dir.name, allow_local_repos=False)
 
 
 if __name__ == "__main__":

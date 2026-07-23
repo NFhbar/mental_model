@@ -16,6 +16,18 @@ services:
         value: gpt-5.6-sol
       - key: MENTAL_MODEL_REASONING_EFFORT
         value: medium
+      - key: ALLOW_LOCAL_REPOS
+        value: "false"
+      - key: MAX_TOTAL_REPOSITORIES
+        value: "6"
+      - key: GIT_CLONE_TIMEOUT_SECONDS
+        value: "120"
+      - key: AUTH_TOKEN_TTL_SECONDS
+        value: "28800"
+      - key: AUTH_FAILURE_LIMIT
+        value: "5"
+      - key: ASK_RATE_LIMIT
+        value: "20"
       - key: OPENAI_API_KEY
         sync: false
       - key: APP_PASSWORD

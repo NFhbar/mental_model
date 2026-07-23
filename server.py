@@ -1,32 +1,65 @@
 import asyncio
 import json
+import logging
 import os
 import secrets
+import time
 import uuid
-from typing import Dict, Set
+from collections import defaultdict, deque
+from typing import Deque, Dict
 
-from dotenv import load_dotenv
+from config import load_local_env
 
-load_dotenv()
+load_local_env()
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from openai import AsyncOpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from agent import MODEL, REASONING_EFFORT, MentalModel
-from tools import GitToolError, prepare_repo
+from tools import GitToolError, canonical_repo_source, prepare_repo
 
 app = FastAPI(title="Mental Model")
+logger = logging.getLogger("mental-model")
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=[
+        host.strip()
+        for host in os.environ.get(
+            "ALLOWED_HOSTS",
+            "localhost,127.0.0.1,testserver,*.onrender.com",
+        ).split(",")
+        if host.strip()
+    ],
+)
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 MAX_REPOSITORIES = 3
+MAX_TOTAL_REPOSITORIES = int(os.environ.get("MAX_TOTAL_REPOSITORIES", "9"))
+AUTH_TOKEN_TTL_SECONDS = int(os.environ.get("AUTH_TOKEN_TTL_SECONDS", "28800"))
+AUTH_FAILURE_LIMIT = int(os.environ.get("AUTH_FAILURE_LIMIT", "5"))
+AUTH_FAILURE_WINDOW_SECONDS = int(
+    os.environ.get("AUTH_FAILURE_WINDOW_SECONDS", "300")
+)
+ASK_RATE_LIMIT = int(os.environ.get("ASK_RATE_LIMIT", "20"))
+ASK_RATE_WINDOW_SECONDS = int(os.environ.get("ASK_RATE_WINDOW_SECONDS", "60"))
+CLONE_TIMEOUT_SECONDS = int(os.environ.get("GIT_CLONE_TIMEOUT_SECONDS", "120"))
+ALLOW_LOCAL_REPOS = os.environ.get("ALLOW_LOCAL_REPOS", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 sessions: Dict[str, MentalModel] = {}
 session_owners: Dict[str, str] = {}
 session_info: Dict[str, Dict] = {}
-auth_tokens: Set[str] = set()
+session_locks: Dict[str, asyncio.Lock] = {}
+auth_tokens: Dict[str, float] = {}
+auth_failures: Dict[str, Deque[float]] = defaultdict(deque)
+ask_requests: Dict[str, Deque[float]] = defaultdict(deque)
 
 
 @app.on_event("shutdown")
@@ -36,32 +69,62 @@ def cleanup_temporary_repositories():
 
 
 class OpenRepoRequest(BaseModel):
-    source: str
+    source: str = Field(min_length=1, max_length=2048)
 
 
 class AskRequest(BaseModel):
-    session_id: str
-    question: str
+    session_id: str = Field(min_length=16, max_length=64)
+    question: str = Field(min_length=1, max_length=4000)
 
 
 class AuthRequest(BaseModel):
-    password: str
+    password: str = Field(max_length=512)
+
+
+def prune_requests(requests: Deque[float], window_seconds: int):
+    cutoff = time.monotonic() - window_seconds
+    while requests and requests[0] <= cutoff:
+        requests.popleft()
+
+
+def enforce_rate_limit(
+    buckets: Dict[str, Deque[float]],
+    key: str,
+    limit: int,
+    window_seconds: int,
+    detail: str,
+):
+    requests = buckets.setdefault(key, deque())
+    prune_requests(requests, window_seconds)
+    if len(requests) >= limit:
+        retry_after = max(1, int(window_seconds - (time.monotonic() - requests[0])))
+        raise HTTPException(
+            status_code=429,
+            detail=detail,
+            headers={"Retry-After": str(retry_after)},
+        )
+    requests.append(time.monotonic())
+
+
+def token_is_valid(token: str) -> bool:
+    if not APP_PASSWORD:
+        return True
+    expires_at = auth_tokens.get(token)
+    if expires_at is None or expires_at <= time.monotonic():
+        auth_tokens.pop(token, None)
+        return False
+    return True
 
 
 def require_auth(token: str):
-    if APP_PASSWORD and token not in auth_tokens:
+    if not APP_PASSWORD:
+        return
+    if not token_is_valid(token):
         raise HTTPException(status_code=401, detail="authentication required")
 
 
 def owner_id(token: str) -> str:
     return token if APP_PASSWORD else "public"
-
-
-def normalized_source(source: str) -> str:
-    source = source.strip()
-    if source.startswith(("http://", "https://", "git@")):
-        return source.rstrip("/").removesuffix(".git").lower()
-    return os.path.realpath(os.path.expanduser(source))
 
 
 def owned_agent(session_id: str, token: str) -> MentalModel:
@@ -76,8 +139,9 @@ def owned_agent(session_id: str, token: str) -> MentalModel:
 def get_config(x_auth_token: str = Header(default="")):
     return {
         "auth_required": bool(APP_PASSWORD),
-        "authenticated": not APP_PASSWORD or x_auth_token in auth_tokens,
+        "authenticated": token_is_valid(x_auth_token),
         "max_repositories": MAX_REPOSITORIES,
+        "allow_local_repositories": ALLOW_LOCAL_REPOS,
     }
 
 
@@ -87,14 +151,32 @@ def health():
 
 
 @app.post("/api/auth")
-def authenticate(req: AuthRequest):
+def authenticate(req: AuthRequest, request: Request):
     if not APP_PASSWORD:
         return {"token": ""}
+    client = request.client.host if request.client else "unknown"
+    failures = auth_failures[client]
+    prune_requests(failures, AUTH_FAILURE_WINDOW_SECONDS)
+    if len(failures) >= AUTH_FAILURE_LIMIT:
+        retry_after = max(
+            1,
+            int(
+                AUTH_FAILURE_WINDOW_SECONDS
+                - (time.monotonic() - failures[0])
+            ),
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="too many authentication failures",
+            headers={"Retry-After": str(retry_after)},
+        )
     if not secrets.compare_digest(req.password, APP_PASSWORD):
+        failures.append(time.monotonic())
         raise HTTPException(status_code=401, detail="wrong password")
-    token = uuid.uuid4().hex
-    auth_tokens.add(token)
-    return {"token": token}
+    auth_failures.pop(client, None)
+    token = secrets.token_urlsafe(32)
+    auth_tokens[token] = time.monotonic() + AUTH_TOKEN_TTL_SECONDS
+    return {"token": token, "expires_in": AUTH_TOKEN_TTL_SECONDS}
 
 
 @app.get("/api/diagnose")
@@ -150,7 +232,10 @@ async def diagnose(x_auth_token: str = Header(default="")):
 def open_repo(req: OpenRepoRequest, x_auth_token: str = Header(default="")):
     require_auth(x_auth_token)
     owner = owner_id(x_auth_token)
-    source_key = normalized_source(req.source)
+    try:
+        source_key = canonical_repo_source(req.source, ALLOW_LOCAL_REPOS)
+    except GitToolError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     for session_id, info in session_info.items():
         if session_owners.get(session_id) == owner and info["source_key"] == source_key:
             return info["response"]
@@ -164,8 +249,17 @@ def open_repo(req: OpenRepoRequest, x_auth_token: str = Header(default="")):
             status_code=409,
             detail=f"repository limit reached ({MAX_REPOSITORIES})",
         )
+    if len(sessions) >= MAX_TOTAL_REPOSITORIES:
+        raise HTTPException(
+            status_code=503,
+            detail="global repository capacity reached",
+        )
     try:
-        repo = prepare_repo(req.source)
+        repo = prepare_repo(
+            source_key,
+            allow_local_repos=ALLOW_LOCAL_REPOS,
+            clone_timeout_seconds=CLONE_TIMEOUT_SECONDS,
+        )
     except GitToolError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     session_id = uuid.uuid4().hex
@@ -178,7 +272,6 @@ def open_repo(req: OpenRepoRequest, x_auth_token: str = Header(default="")):
         "session_id": session_id,
         "source": req.source.strip(),
         "summary": repo.summary(),
-        "root": repo.root,
         "name": name,
         "web_url": repo.remote_web_url(),
     }
@@ -192,10 +285,14 @@ def open_repo(req: OpenRepoRequest, x_auth_token: str = Header(default="")):
 @app.delete("/api/repo/{session_id}")
 def close_repo(session_id: str, x_auth_token: str = Header(default="")):
     agent = owned_agent(session_id, x_auth_token)
+    lock = session_locks.get(session_id)
+    if lock and lock.locked():
+        raise HTTPException(status_code=409, detail="investigation in progress")
     agent.repo.cleanup()
     del sessions[session_id]
     session_owners.pop(session_id, None)
     session_info.pop(session_id, None)
+    session_locks.pop(session_id, None)
     return {"deleted": True}
 
 
@@ -208,23 +305,40 @@ def session_meta(session_id: str, x_auth_token: str = Header(default="")):
 @app.post("/api/ask")
 async def ask(req: AskRequest, x_auth_token: str = Header(default="")):
     agent = owned_agent(req.session_id, x_auth_token)
-    snapshot = agent.snapshot_state()
+    enforce_rate_limit(
+        ask_requests,
+        owner_id(x_auth_token),
+        ASK_RATE_LIMIT,
+        ASK_RATE_WINDOW_SECONDS,
+        "investigation rate limit reached",
+    )
+    lock = session_locks.setdefault(req.session_id, asyncio.Lock())
 
     async def event_stream():
-        completed = False
-        try:
-            async for event in agent.ask(req.question):
-                if event["kind"] == "answer":
-                    completed = True
-                yield {"event": event["kind"], "data": json.dumps(event)}
-        except asyncio.CancelledError:
-            if not completed:
+        async with lock:
+            snapshot = agent.snapshot_state()
+            completed = False
+            try:
+                async for event in agent.ask(req.question):
+                    if event["kind"] == "answer":
+                        completed = True
+                    elif event["kind"] == "error":
+                        agent.restore_state(snapshot)
+                    yield {"event": event["kind"], "data": json.dumps(event)}
+            except asyncio.CancelledError:
+                if not completed:
+                    agent.restore_state(snapshot)
+                raise
+            except Exception:
                 agent.restore_state(snapshot)
-            raise
-        except Exception as exc:
-            agent.restore_state(snapshot)
-            yield {"event": "error", "data": json.dumps({"kind": "error", "text": str(exc)})}
-        yield {"event": "done", "data": "{}"}
+                logger.exception("investigation failed")
+                yield {
+                    "event": "error",
+                    "data": json.dumps(
+                        {"kind": "error", "text": "investigation failed"}
+                    ),
+                }
+            yield {"event": "done", "data": "{}"}
 
     return EventSourceResponse(event_stream())
 
