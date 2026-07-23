@@ -1,0 +1,38 @@
+[
+  {
+    "id": "repository-purpose",
+    "question": "What is Click and what problem does this repository solve?",
+    "expected_any": [
+      ["file:README.md@HEAD"]
+    ]
+  },
+  {
+    "id": "supported-python",
+    "question": "Which Python versions does the current Click package support?",
+    "expected_any": [
+      ["file:pyproject.toml@HEAD"]
+    ]
+  },
+  {
+    "id": "testing-utilities",
+    "question": "What testing support does Click provide, and what isolation caveat should users know?",
+    "expected_any": [
+      ["file:docs/testing.md@HEAD"]
+    ]
+  },
+  {
+    "id": "design-opinions",
+    "question": "What design opinions guide Click's API and behavior?",
+    "expected_any": [
+      ["file:docs/design-opinions.md@HEAD"]
+    ]
+  },
+  {
+    "id": "powershell-intent",
+    "question": "When was built-in PowerShell completion added, and what motivation or trade-offs were discussed?",
+    "expected_any": [
+      ["pr:3637"],
+      ["commit:7df2f82", "commit:27b3ee2"]
+    ]
+  }
+]

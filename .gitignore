@@ -4,3 +4,5 @@ node_modules/
 frontend/dist/
 .env
 .DS_Store
+report_materials
+requirements.md

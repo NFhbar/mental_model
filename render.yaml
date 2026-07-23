@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: mental-model
+    runtime: python
+    plan: free
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt && npm --prefix frontend ci && npm --prefix frontend run build
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit
+    maxShutdownDelaySeconds: 30
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.11
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: MENTAL_MODEL_LLM
+        value: gpt-5.4
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: APP_PASSWORD
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false

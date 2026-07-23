@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import secrets
@@ -20,9 +21,18 @@ from tools import GitToolError, prepare_repo
 app = FastAPI(title="Mental Model")
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+MAX_REPOSITORIES = 3
 
 sessions: Dict[str, MentalModel] = {}
+session_owners: Dict[str, str] = {}
+session_info: Dict[str, Dict] = {}
 auth_tokens: Set[str] = set()
+
+
+@app.on_event("shutdown")
+def cleanup_temporary_repositories():
+    for agent in sessions.values():
+        agent.repo.cleanup()
 
 
 class OpenRepoRequest(BaseModel):
@@ -43,9 +53,37 @@ def require_auth(token: str):
         raise HTTPException(status_code=401, detail="authentication required")
 
 
+def owner_id(token: str) -> str:
+    return token if APP_PASSWORD else "public"
+
+
+def normalized_source(source: str) -> str:
+    source = source.strip()
+    if source.startswith(("http://", "https://", "git@")):
+        return source.rstrip("/").removesuffix(".git").lower()
+    return os.path.realpath(os.path.expanduser(source))
+
+
+def owned_agent(session_id: str, token: str) -> MentalModel:
+    require_auth(token)
+    agent = sessions.get(session_id)
+    if agent is None or session_owners.get(session_id) != owner_id(token):
+        raise HTTPException(status_code=404, detail="unknown session")
+    return agent
+
+
 @app.get("/api/config")
-def get_config():
-    return {"auth_required": bool(APP_PASSWORD)}
+def get_config(x_auth_token: str = Header(default="")):
+    return {
+        "auth_required": bool(APP_PASSWORD),
+        "authenticated": not APP_PASSWORD or x_auth_token in auth_tokens,
+        "max_repositories": MAX_REPOSITORIES,
+    }
+
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok"}
 
 
 @app.post("/api/auth")
@@ -94,35 +132,80 @@ async def diagnose(x_auth_token: str = Header(default="")):
 @app.post("/api/repo")
 def open_repo(req: OpenRepoRequest, x_auth_token: str = Header(default="")):
     require_auth(x_auth_token)
+    owner = owner_id(x_auth_token)
+    source_key = normalized_source(req.source)
+    for session_id, info in session_info.items():
+        if session_owners.get(session_id) == owner and info["source_key"] == source_key:
+            return info["response"]
+    owned_sessions = [
+        session_id
+        for session_id, session_owner in session_owners.items()
+        if session_owner == owner
+    ]
+    if len(owned_sessions) >= MAX_REPOSITORIES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"repository limit reached ({MAX_REPOSITORIES})",
+        )
     try:
         repo = prepare_repo(req.source)
     except GitToolError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     session_id = uuid.uuid4().hex
     sessions[session_id] = MentalModel(repo)
+    session_owners[session_id] = owner
     name = os.path.basename(req.source.strip().rstrip("/"))
     if name.endswith(".git"):
         name = name[:-4]
-    return {
+    response = {
         "session_id": session_id,
+        "source": req.source.strip(),
         "summary": repo.summary(),
         "root": repo.root,
         "name": name,
         "web_url": repo.remote_web_url(),
     }
+    session_info[session_id] = {
+        "source_key": source_key,
+        "response": response,
+    }
+    return response
+
+
+@app.delete("/api/repo/{session_id}")
+def close_repo(session_id: str, x_auth_token: str = Header(default="")):
+    agent = owned_agent(session_id, x_auth_token)
+    agent.repo.cleanup()
+    del sessions[session_id]
+    session_owners.pop(session_id, None)
+    session_info.pop(session_id, None)
+    return {"deleted": True}
+
+
+@app.get("/api/meta/{session_id}")
+def session_meta(session_id: str, x_auth_token: str = Header(default="")):
+    agent = owned_agent(session_id, x_auth_token)
+    return agent.metadata()
 
 
 @app.post("/api/ask")
-async def ask(req: AskRequest):
-    agent = sessions.get(req.session_id)
-    if agent is None:
-        raise HTTPException(status_code=404, detail="unknown session")
+async def ask(req: AskRequest, x_auth_token: str = Header(default="")):
+    agent = owned_agent(req.session_id, x_auth_token)
+    snapshot = agent.snapshot_state()
 
     async def event_stream():
+        completed = False
         try:
             async for event in agent.ask(req.question):
+                if event["kind"] == "answer":
+                    completed = True
                 yield {"event": event["kind"], "data": json.dumps(event)}
+        except asyncio.CancelledError:
+            if not completed:
+                agent.restore_state(snapshot)
+            raise
         except Exception as exc:
+            agent.restore_state(snapshot)
             yield {"event": "error", "data": json.dumps({"kind": "error", "text": str(exc)})}
         yield {"event": "done", "data": "{}"}
 
@@ -130,10 +213,10 @@ async def ask(req: AskRequest):
 
 
 @app.get("/api/commit/{session_id}/{sha}")
-def commit_detail(session_id: str, sha: str):
-    agent = sessions.get(session_id)
-    if agent is None:
-        raise HTTPException(status_code=404, detail="unknown session")
+def commit_detail(
+    session_id: str, sha: str, x_auth_token: str = Header(default="")
+):
+    agent = owned_agent(session_id, x_auth_token)
     try:
         return {"detail": agent.repo.show_commit(sha)}
     except GitToolError as exc:

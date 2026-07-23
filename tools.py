@@ -1,8 +1,11 @@
+import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import urllib.error
+import urllib.request
 from typing import Dict, List, Optional
 
 MAX_OUTPUT_CHARS = 8000
@@ -28,14 +31,22 @@ def _validate_ref(ref: str) -> str:
 
 
 class GitRepo:
-    def __init__(self, root: str):
+    def __init__(self, root: str, temporary: bool = False):
         self.root = os.path.abspath(root)
+        self.temporary = temporary
         if not os.path.isdir(os.path.join(self.root, ".git")) and not os.path.isfile(
             os.path.join(self.root, ".git")
         ):
             raise GitToolError(f"not a git repository: {self.root}")
 
-    def _run(self, args: List[str], timeout: int = 30) -> str:
+    def cleanup(self):
+        if self.temporary:
+            shutil.rmtree(self.root, ignore_errors=True)
+            self.temporary = False
+
+    def _run(
+        self, args: List[str], timeout: int = 30, allow_no_matches: bool = False
+    ) -> str:
         result = subprocess.run(
             ["git", "-C", self.root, "--no-pager"] + args,
             capture_output=True,
@@ -43,7 +54,9 @@ class GitRepo:
             timeout=timeout,
             errors="replace",
         )
-        if result.returncode != 0:
+        if result.returncode != 0 and not (
+            allow_no_matches and result.returncode == 1
+        ):
             raise GitToolError(result.stderr.strip() or f"git {args[0]} failed")
         return result.stdout
 
@@ -53,10 +66,30 @@ class GitRepo:
         count = self._run(["rev-list", "--count", "HEAD"]).strip()
         return {"head": head, "branch": branch, "commit_count": count}
 
-    def remote_web_url(self) -> Optional[str]:
+    def prompt_context(self) -> str:
+        summary = self.summary()
+        entries = self._run(["ls-tree", "--name-only", "HEAD"]).splitlines()
+        top_level = ", ".join(entries[:40])
+        if len(entries) > 40:
+            top_level += f", ... ({len(entries) - 40} more)"
+        remote = self.remote_web_url() or "none"
+        return (
+            f"branch: {summary['branch']}\n"
+            f"commits: {summary['commit_count']}\n"
+            f"HEAD: {summary['head']}\n"
+            f"origin: {remote}\n"
+            f"top-level entries: {top_level or 'none'}"
+        )
+
+    def _origin_url(self) -> Optional[str]:
         try:
-            url = self._run(["config", "--get", "remote.origin.url"]).strip()
+            return self._run(["config", "--get", "remote.origin.url"]).strip()
         except GitToolError:
+            return None
+
+    def remote_web_url(self) -> Optional[str]:
+        url = self._origin_url()
+        if not url:
             return None
         match = re.match(r"^git@([^:]+):(.+?)(?:\.git)?$", url)
         if match:
@@ -64,6 +97,16 @@ class GitRepo:
         if url.startswith("http"):
             return url[:-4] if url.endswith(".git") else url
         return None
+
+    def github_slug(self) -> Optional[str]:
+        url = self._origin_url()
+        if not url:
+            return None
+        match = re.match(
+            r"^(?:https?://github\.com/|git@github\.com:)([^/]+/[^/]+?)(?:\.git)?$",
+            url,
+        )
+        return match.group(1) if match else None
 
     def commit_exists(self, sha: str) -> bool:
         if not SHA_RE.match(sha):
@@ -156,11 +199,114 @@ class GitRepo:
         suffix = "" if end >= len(lines) else f"\n... [{len(lines) - end} more lines]"
         return _truncate(numbered + suffix)
 
+    def search_code(
+        self,
+        query: str,
+        regex: bool = False,
+        path: Optional[str] = None,
+        ref: str = "HEAD",
+        max_count: int = 50,
+    ) -> str:
+        _validate_ref(ref)
+        args = ["grep", "-n", "-I"]
+        if regex:
+            args.append("-E")
+        args += ["-e", query, ref]
+        if path:
+            args += ["--", path]
+        out = self._run(args, timeout=60, allow_no_matches=True)
+        lines = out.splitlines()
+        limit = min(max(int(max_count), 1), 200)
+        selected = lines[:limit]
+        suffix = (
+            f"\n... [{len(lines) - limit} more matches]"
+            if len(lines) > limit
+            else ""
+        )
+        return "\n".join(selected) + suffix if selected else "no code matched"
+
     def list_tree(self, path: str = ".", ref: str = "HEAD") -> str:
         _validate_ref(ref)
         target = f"{ref}:{path}" if path not in (".", "") else ref
         out = self._run(["ls-tree", "--format=%(objecttype) %(path)", target])
         return _truncate(out)
+
+    def _github_get(self, path: str):
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "mental-model",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        token = os.environ.get("GITHUB_TOKEN")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        request = urllib.request.Request(
+            f"https://api.github.com{path}", headers=headers
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            try:
+                body = json.loads(exc.read().decode("utf-8", errors="replace"))
+                message = body.get("message", str(exc))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                message = str(exc)
+            raise GitToolError(f"GitHub API returned {exc.code}: {message}")
+        except urllib.error.URLError as exc:
+            raise GitToolError(f"GitHub API request failed: {exc.reason}")
+
+    def get_pull_request_context(
+        self,
+        number: Optional[int] = None,
+        commit_sha: Optional[str] = None,
+        max_comments: int = 10,
+    ) -> str:
+        slug = self.github_slug()
+        if not slug:
+            raise GitToolError("repository origin is not a GitHub repository")
+        if number is None and commit_sha is None:
+            raise GitToolError("provide either number or commit_sha")
+        if commit_sha:
+            _validate_ref(commit_sha)
+            pulls = self._github_get(f"/repos/{slug}/commits/{commit_sha}/pulls")
+            if not pulls:
+                return f"no GitHub pull request found for commit {commit_sha}"
+            pull = pulls[0]
+            number = int(pull["number"])
+        if number is None or int(number) < 1:
+            raise GitToolError("pull request number must be positive")
+        number = int(number)
+        pull = self._github_get(f"/repos/{slug}/pulls/{number}")
+        limit = min(max(int(max_comments), 0), 30)
+        comments = self._github_get(
+            f"/repos/{slug}/issues/{number}/comments?per_page={limit}"
+        )
+        reviews = self._github_get(
+            f"/repos/{slug}/pulls/{number}/reviews?per_page={limit}"
+        )
+        lines = [
+            f"SOURCE pr:{number}",
+            f"URL: {pull['html_url']}",
+            f"Title: {pull['title']}",
+            f"Author: {pull['user']['login']}",
+            f"State: {pull['state']}",
+            f"Merged at: {pull.get('merged_at') or 'not merged'}",
+            "Body:",
+            pull.get("body") or "(empty)",
+        ]
+        if comments:
+            lines.append("Discussion comments:")
+            for comment in comments[:limit]:
+                lines.append(
+                    f"[{comment['user']['login']}] {comment.get('body') or '(empty)'}"
+                )
+        review_bodies = [review for review in reviews[:limit] if review.get("body")]
+        if review_bodies:
+            lines.append("Review summaries:")
+            for review in review_bodies:
+                lines.append(f"[{review['user']['login']}] {review['body']}")
+        return _truncate("\n".join(lines))
 
 
 def prepare_repo(source: str) -> GitRepo:
@@ -176,7 +322,7 @@ def prepare_repo(source: str) -> GitRepo:
         if result.returncode != 0:
             shutil.rmtree(dest, ignore_errors=True)
             raise GitToolError(f"clone failed: {result.stderr.strip()[:500]}")
-        return GitRepo(dest)
+        return GitRepo(dest, temporary=True)
     expanded = os.path.expanduser(source)
     if not os.path.isdir(expanded):
         raise GitToolError(f"no such directory: {source}")
@@ -271,6 +417,24 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "search_code",
+            "description": "Search tracked file contents at a git ref. Use this to discover symbols, concepts, configuration, and documentation before reading a specific file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "regex": {"type": "boolean", "default": False},
+                    "path": {"type": "string"},
+                    "ref": {"type": "string", "default": "HEAD"},
+                    "max_count": {"type": "integer", "default": 50},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_tree",
             "description": "List files and directories at a path within the repo at a given ref. Use to orient yourself.",
             "parameters": {
@@ -278,6 +442,21 @@ TOOL_SCHEMAS = [
                 "properties": {
                     "path": {"type": "string", "default": "."},
                     "ref": {"type": "string", "default": "HEAD"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_pull_request_context",
+            "description": "Retrieve a GitHub pull request's title, body, discussion comments, and review summaries. Resolve it by PR number or by an associated commit SHA. Use PR evidence for motivation, trade-offs, and design intent that git history alone cannot establish.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "number": {"type": "integer"},
+                    "commit_sha": {"type": "string"},
+                    "max_comments": {"type": "integer", "default": 10},
                 },
             },
         },
@@ -292,7 +471,9 @@ def dispatch_tool(repo: GitRepo, name: str, args: Dict) -> str:
         "show_commit": repo.show_commit,
         "blame_lines": repo.blame_lines,
         "read_file_at_ref": repo.read_file_at_ref,
+        "search_code": repo.search_code,
         "list_tree": repo.list_tree,
+        "get_pull_request_context": repo.get_pull_request_context,
     }
     if name not in handlers:
         return f"error: unknown tool {name}"
